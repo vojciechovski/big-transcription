@@ -42,12 +42,6 @@ else:
                            value=default_api_key,
                            type="password")
 
-# Verificar se a chave API está configurada
-if not api_key:
-    st.warning("⚠️ Você precisa configurar uma chave API da OpenAI para usar este aplicativo.")
-    st.info("💡 A chave API pode ser configurada via variável de ambiente ou inserida no campo acima.")
-    st.stop()
-
 # Upload de arquivo
 uploaded_file = st.file_uploader(
     f"Escolha um arquivo de áudio (até {MAX_UPLOAD_SIZE_MB}MB)", 
