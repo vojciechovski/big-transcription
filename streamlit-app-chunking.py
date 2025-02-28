@@ -2,6 +2,8 @@ import streamlit as st
 import os
 import tempfile
 import time
+import subprocess
+import shutil
 from openai import OpenAI
 from dotenv import load_dotenv
 from pydub import AudioSegment
@@ -26,7 +28,7 @@ BYTES_PER_MB = 1024 * 1024
 st.title("🎤 Transcritor de Áudio")
 st.markdown(f"""
     Faça upload de arquivos de áudio de até {MAX_UPLOAD_SIZE_MB}MB e obtenha sua transcrição completa.
-    O arquivo será automaticamente dividido em segmentos menores para processamento.
+    O arquivo será automaticamente convertido para um formato compatível e dividido em segmentos menores para processamento.
 """)
 
 # Obter a chave API do ambiente ou permitir entrada manual
@@ -51,7 +53,7 @@ if not api_key:
 # Upload de arquivo
 uploaded_file = st.file_uploader(
     f"Escolha um arquivo de áudio (até {MAX_UPLOAD_SIZE_MB}MB)", 
-    type=["mp3", "wav", "ogg"]  # Removido m4a e flac para evitar problemas de compatibilidade
+    type=["mp3", "wav", "m4a", "ogg", "flac", "aac"]
 )
 
 # Opções para idioma de transcrição
@@ -61,13 +63,80 @@ idioma = st.selectbox(
     index=0
 )
 
-# Configurar pydub para usar formato de saída adequado
-# Este é um truque para evitar problemas com formatos não suportados
-AudioSegment.converter = "ffmpeg"
-AudioSegment.ffmpeg = "ffmpeg"
-AudioSegment.ffprobe = "ffprobe"
+# Funções auxiliares
 
-# Função para dividir o arquivo de áudio em segmentos
+def check_ffmpeg_installed():
+    """Verifica se o ffmpeg está instalado e funcional"""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"], 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE, 
+            text=True
+        )
+        return result.returncode == 0
+    except:
+        return False
+
+def convert_audio_to_wav(input_path, output_dir=None):
+    """
+    Converte um arquivo de áudio para WAV usando ffmpeg diretamente
+    
+    Args:
+        input_path: Caminho para o arquivo de entrada
+        output_dir: Diretório para salvar o arquivo convertido (opcional)
+        
+    Returns:
+        Caminho para o arquivo WAV convertido
+    """
+    # Determinar o diretório de saída
+    if output_dir is None:
+        output_dir = os.path.dirname(input_path)
+    
+    # Gerar o nome do arquivo de saída
+    output_filename = os.path.splitext(os.path.basename(input_path))[0] + ".wav"
+    output_path = os.path.join(output_dir, output_filename)
+    
+    # Comando para converter para WAV
+    try:
+        # Tentar usando processo direto do ffmpeg (mais confiável)
+        cmd = [
+            "ffmpeg", 
+            "-i", input_path,
+            "-ar", "44100",  # Taxa de amostragem de 44.1kHz
+            "-ac", "1",      # Mono (1 canal)
+            "-c:a", "pcm_s16le",  # Codec de áudio PCM 16-bit
+            "-y",            # Sobrescrever arquivo de saída se existir
+            output_path
+        ]
+        
+        # Executar o comando
+        process = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Verificar se a conversão foi bem-sucedida
+        if process.returncode != 0:
+            error_message = process.stderr
+            st.error(f"Erro na conversão com ffmpeg: {error_message}")
+            
+            # Tentar com pydub como alternativa
+            try:
+                audio = AudioSegment.from_file(input_path)
+                audio.export(output_path, format="wav")
+            except Exception as pydub_err:
+                st.error(f"Também falhou com pydub: {str(pydub_err)}")
+                raise ValueError(f"Não foi possível converter o arquivo: {error_message}")
+        
+        return output_path
+    
+    except Exception as e:
+        st.error(f"Erro ao tentar converter: {str(e)}")
+        raise
+
 def split_audio_file(file_path, segment_size_mb=MAX_SEGMENT_SIZE_MB):
     """
     Divide um arquivo de áudio em segmentos menores
@@ -79,60 +148,69 @@ def split_audio_file(file_path, segment_size_mb=MAX_SEGMENT_SIZE_MB):
     Returns:
         Lista de caminhos para os arquivos de segmento
     """
-    # Determinar o formato do arquivo
-    file_format = file_path.split(".")[-1].lower()
-    
-    # Verificar formato suportado
-    supported_formats = ["mp3", "wav", "ogg"]
-    if file_format not in supported_formats:
-        raise ValueError(f"Formato não suportado: {file_format}. Use mp3, wav ou ogg.")
-    
-    # Formato seguro para saída (sempre wav para melhor compatibilidade)
-    safe_output_format = "wav"
-    
     try:
-        # Carregar o arquivo de áudio
-        if file_format == "mp3":
-            audio = AudioSegment.from_mp3(file_path)
-        elif file_format == "wav":
-            audio = AudioSegment.from_wav(file_path)
-        elif file_format == "ogg":
-            audio = AudioSegment.from_ogg(file_path)
-        else:
-            # Caso genérico (não deve ocorrer devido à verificação acima)
-            audio = AudioSegment.from_file(file_path)
+        # Carregar o arquivo de áudio (agora sempre WAV)
+        audio = AudioSegment.from_wav(file_path)
+        
+        # Calcular o número de segmentos necessários
+        duration_ms = len(audio)
+        file_size = os.path.getsize(file_path)
+        
+        # Estimar bytes por ms para cálculo de tamanho de segmento
+        bytes_per_ms = file_size / duration_ms
+        segment_size_ms = int((segment_size_mb * BYTES_PER_MB) / bytes_per_ms)
+        
+        # Ajustar para garantir que não excedemos o limite
+        segment_size_ms = min(segment_size_ms, duration_ms)
+        
+        # Criar lista para armazenar caminhos dos segmentos
+        segment_paths = []
+        
+        # Dividir o áudio em segmentos
+        segments_count = math.ceil(duration_ms / segment_size_ms)
+        
+        for i in range(segments_count):
+            start_ms = i * segment_size_ms
+            end_ms = min((i + 1) * segment_size_ms, duration_ms)
+            
+            segment = audio[start_ms:end_ms]
+            segment_path = f"{file_path}_segment_{i}.wav"
+            
+            # Exportar segmento
+            segment.export(segment_path, format="wav")
+            segment_paths.append(segment_path)
+        
+        return segment_paths
+    
     except Exception as e:
-        raise ValueError(f"Erro ao processar arquivo de áudio: {str(e)}")
-    
-    # Calcular o número de segmentos necessários
-    duration_ms = len(audio)
-    # Estimativa aproximada: 1 minuto de áudio = ~1MB (varia muito com qualidade)
-    bytes_per_ms = os.path.getsize(file_path) / duration_ms
-    segment_size_ms = int((segment_size_mb * BYTES_PER_MB) / bytes_per_ms)
-    
-    # Ajustar para garantir que não excedemos o limite
-    segment_size_ms = min(segment_size_ms, duration_ms)
-    
-    # Criar lista para armazenar caminhos dos segmentos
-    segment_paths = []
-    
-    # Dividir o áudio em segmentos
-    segments_count = math.ceil(duration_ms / segment_size_ms)
-    
-    for i in range(segments_count):
-        start_ms = i * segment_size_ms
-        end_ms = min((i + 1) * segment_size_ms, duration_ms)
+        st.error(f"Erro ao dividir arquivo: {str(e)}")
         
-        segment = audio[start_ms:end_ms]
-        segment_path = f"{file_path}_segment_{i}.{safe_output_format}"
-        
-        # Exportar segmento como WAV (formato mais seguro)
-        segment.export(segment_path, format=safe_output_format)
-        segment_paths.append(segment_path)
-    
-    return segment_paths
+        # Método alternativo de segmentação (baseado em tempo em vez de tamanho)
+        try:
+            audio = AudioSegment.from_wav(file_path)
+            duration_ms = len(audio)
+            
+            # Dividir em segmentos de 5 minutos
+            segment_length_ms = 5 * 60 * 1000
+            segments_count = math.ceil(duration_ms / segment_length_ms)
+            
+            segment_paths = []
+            for i in range(segments_count):
+                start_ms = i * segment_length_ms
+                end_ms = min((i + 1) * segment_length_ms, duration_ms)
+                
+                segment = audio[start_ms:end_ms]
+                segment_path = f"{file_path}_segment_{i}.wav"
+                
+                segment.export(segment_path, format="wav")
+                segment_paths.append(segment_path)
+            
+            return segment_paths
+            
+        except Exception as alt_err:
+            st.error(f"Método alternativo de segmentação também falhou: {str(alt_err)}")
+            raise
 
-# Função para transcrever um segmento
 def transcribe_segment(segment_path, client, language):
     """
     Transcreve um segmento de áudio usando a API OpenAI
@@ -157,6 +235,10 @@ def transcribe_segment(segment_path, client, language):
             st.error(f"Erro ao transcrever segmento {segment_path}: {str(e)}")
             return ""  # Retornar string vazia em caso de erro para não interromper todo o processo
 
+# Verificar FFMPEG
+if not check_ffmpeg_installed():
+    st.warning("⚠️ FFMPEG não encontrado ou não está funcionando corretamente. A conversão de formatos pode falhar.")
+
 # Quando o usuário clicar no botão de transcrição
 if st.button("Transcrever") and uploaded_file is not None:
     # Verificar o tamanho do arquivo
@@ -177,25 +259,36 @@ if st.button("Transcrever") and uploaded_file is not None:
         # Criar diretório temporário para os arquivos
         with tempfile.TemporaryDirectory() as temp_dir:
             # Salvar o arquivo temporariamente
-            temp_file_path = os.path.join(temp_dir, uploaded_file.name)
-            with open(temp_file_path, "wb") as f:
+            original_file_path = os.path.join(temp_dir, uploaded_file.name)
+            with open(original_file_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
             
-            status_text.text("Analisando arquivo de áudio...")
+            # Obter formato do arquivo
+            file_format = os.path.splitext(original_file_path)[1].lower()[1:]
             
-            # Verificar se é um formato de arquivo suportado
-            file_format = os.path.splitext(temp_file_path)[1].lower()[1:]
-            supported_formats = ["mp3", "wav", "ogg"]
-            if file_format not in supported_formats:
-                st.error(f"Formato não suportado: {file_format}. Use mp3, wav ou ogg.")
-                st.stop()
+            status_text.text("Preparando arquivo de áudio...")
+            progress_bar.progress(0.1)
+            
+            # Converter para WAV se não for WAV
+            if file_format.lower() != "wav":
+                status_text.text(f"Convertendo arquivo {file_format} para WAV...")
+                try:
+                    wav_file_path = convert_audio_to_wav(original_file_path, temp_dir)
+                    status_text.text("Conversão para WAV concluída!")
+                except Exception as conv_err:
+                    st.error(f"Falha ao converter o arquivo: {str(conv_err)}")
+                    st.stop()
+            else:
+                wav_file_path = original_file_path
+            
+            progress_bar.progress(0.2)
             
             # Se o arquivo for menor que o limite da API, processar diretamente
             if file_size_mb <= MAX_SEGMENT_SIZE_MB:
                 status_text.text("Transcrevendo arquivo (único segmento)...")
-                progress_bar.progress(0.2)
+                progress_bar.progress(0.3)
                 
-                with open(temp_file_path, "rb") as audio_file:
+                with open(wav_file_path, "rb") as audio_file:
                     transcript = client.audio.transcriptions.create(
                         model="whisper-1",
                         file=audio_file,
@@ -203,14 +296,14 @@ if st.button("Transcrever") and uploaded_file is not None:
                     )
                 
                 full_transcript = transcript.text
-                progress_bar.progress(1.0)
+                progress_bar.progress(0.9)
             else:
                 # Dividir o arquivo em segmentos
                 status_text.text("Dividindo arquivo em segmentos...")
-                progress_bar.progress(0.1)
+                progress_bar.progress(0.3)
                 
                 try:
-                    segment_paths = split_audio_file(temp_file_path)
+                    segment_paths = split_audio_file(wav_file_path)
                     total_segments = len(segment_paths)
                     
                     status_text.text(f"Arquivo dividido em {total_segments} segmentos. Iniciando transcrição...")
@@ -218,7 +311,7 @@ if st.button("Transcrever") and uploaded_file is not None:
                     # Transcrever cada segmento
                     full_transcript = ""
                     for i, segment_path in enumerate(segment_paths):
-                        progress_percent = 0.1 + (i / total_segments) * 0.8
+                        progress_percent = 0.3 + (i / total_segments) * 0.6
                         progress_bar.progress(progress_percent)
                         status_text.text(f"Transcrevendo segmento {i+1} de {total_segments}...")
                         
@@ -230,54 +323,9 @@ if st.button("Transcrever") and uploaded_file is not None:
                             os.remove(segment_path)
                         except:
                             pass  # Ignorar erros na remoção
-                    
-                    progress_bar.progress(0.9)
-                    status_text.text("Finalizando transcrição...")
-                    time.sleep(1)  # Pequena pausa para UX
                 except Exception as e:
                     st.error(f"Erro ao processar os segmentos: {str(e)}")
-                    st.info("Tentando método alternativo...")
-                    
-                    # Método alternativo: usar a biblioteca diretamente para criar segmentos menores
-                    try:
-                        sound = AudioSegment.from_file(temp_file_path)
-                        duration_ms = len(sound)
-                        
-                        # Dividir em segmentos de aproximadamente 5 minutos (menos que 25MB)
-                        segment_length_ms = 5 * 60 * 1000  # 5 minutos em ms
-                        segments_count = math.ceil(duration_ms / segment_length_ms)
-                        
-                        full_transcript = ""
-                        for i in range(segments_count):
-                            start_ms = i * segment_length_ms
-                            end_ms = min((i + 1) * segment_length_ms, duration_ms)
-                            
-                            segment = sound[start_ms:end_ms]
-                            temp_segment_path = os.path.join(temp_dir, f"segment_{i}.wav")
-                            
-                            progress_percent = 0.1 + (i / segments_count) * 0.4
-                            progress_bar.progress(progress_percent)
-                            status_text.text(f"Criando segmento alternativo {i+1} de {segments_count}...")
-                            
-                            # Exportar como WAV (formato mais seguro)
-                            segment.export(temp_segment_path, format="wav")
-                            
-                            # Transcrever segmento
-                            progress_percent = 0.5 + (i / segments_count) * 0.4
-                            progress_bar.progress(progress_percent)
-                            status_text.text(f"Transcrevendo segmento alternativo {i+1} de {segments_count}...")
-                            
-                            segment_transcript = transcribe_segment(temp_segment_path, client, idioma)
-                            full_transcript += segment_transcript + " "
-                            
-                            # Limpar arquivo temporário
-                            try:
-                                os.remove(temp_segment_path)
-                            except:
-                                pass
-                    except Exception as alt_err:
-                        st.error(f"Erro no método alternativo: {str(alt_err)}")
-                        st.stop()
+                    st.stop()
             
             # Limpar e formatar a transcrição final
             full_transcript = full_transcript.strip()
@@ -301,38 +349,30 @@ if st.button("Transcrever") and uploaded_file is not None:
             
     except Exception as e:
         st.error(f"Ocorreu um erro durante a transcrição: {str(e)}")
-        if "Invalid file format." in str(e):
-            st.warning("O formato do arquivo pode não ser suportado pela API do Whisper ou estar corrompido.")
-            st.info("Tente converter seu arquivo para WAV ou MP3 antes de fazer upload.")
-        elif "maximum allowed size" in str(e):
-            st.warning("Mesmo após a divisão, um dos segmentos pode estar muito grande. Tente um arquivo menor.")
-        elif "ffmpeg" in str(e).lower():
-            st.warning("""
-            Erro relacionado ao FFMPEG. Tente as seguintes soluções:
-            1. Use apenas arquivos MP3, WAV ou OGG
-            2. Converta seu arquivo para WAV antes de fazer upload
-            3. Use um arquivo com menor qualidade/tamanho
-            """)
-            st.info("Detalhes técnicos do erro para suporte:")
-            st.code(str(e))
+        st.info("""
+        Se você encontrou um erro:
+        1. Tente fazer upload de um arquivo WAV diretamente
+        2. Verifique se o arquivo não está corrompido
+        3. Tente um arquivo menor ou de melhor qualidade
+        """)
 
 # Adicionar instruções e informações adicionais
-with st.expander("Como funciona o processamento de arquivos grandes?"):
+with st.expander("Como funciona o processamento de arquivos?"):
     st.markdown("""
-    ### Processo de divisão e transcrição:
+    ### Processo de conversão e transcrição:
 
-    1. **Upload**: Você faz upload de um arquivo de áudio de até 200MB
-    2. **Análise**: O sistema verifica o tamanho do arquivo
-    3. **Divisão**: Se necessário, o arquivo é dividido em segmentos menores (até 25MB cada)
-    4. **Processamento**: Cada segmento é enviado separadamente para a API do Whisper
+    1. **Upload**: Você faz upload de qualquer arquivo de áudio suportado
+    2. **Conversão**: O sistema converte automaticamente para WAV, se necessário
+    3. **Divisão**: Para arquivos maiores que 25MB, o sistema divide em segmentos menores
+    4. **Processamento**: Cada segmento é enviado para a API do Whisper
     5. **Combinação**: As transcrições de todos os segmentos são combinadas
     6. **Resultado**: Você recebe a transcrição completa para download
 
-    ### Compatibilidade e formatos:
-
-    - Formatos recomendados: MP3, WAV, OGG
-    - Para melhor compatibilidade, use arquivos WAV
-    - Se encontrar erros, tente converter seu arquivo para WAV antes de fazer upload
+    ### Formatos suportados:
+    
+    - O sistema aceita vários formatos: MP3, WAV, M4A, OGG, FLAC, AAC
+    - Todos são convertidos automaticamente para WAV antes do processamento
+    - O formato WAV é o mais confiável para a transcrição
     """)
 
 # Instruções e informações adicionais
@@ -342,15 +382,15 @@ st.markdown("""
 1. Faça upload de um arquivo de áudio (até 200MB)
 2. Selecione o idioma do áudio
 3. Clique em "Transcrever"
-4. Acompanhe o progresso da transcrição
+4. Acompanhe o progresso da conversão e transcrição
 5. Baixe o resultado como arquivo TXT
 
-### Dicas para evitar erros:
-- Use preferencialmente arquivos MP3 ou WAV
-- Se tiver problemas, converta seu arquivo para WAV antes de fazer upload
-- Arquivos de menor qualidade (128kbps) são processados mais rapidamente
+### Recursos:
+- Conversão automática de formatos
+- Divisão inteligente de arquivos grandes
+- Suporte a vários idiomas
 """)
 
 # Rodapé
 st.markdown("---")
-st.markdown("Desenvolvido com Streamlit e OpenAI Whisper API")
+st.markdown("Desenvolvido com Streamlit e OpenAI Whisper API | Suporta múltiplos formatos de áudio")
