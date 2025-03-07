@@ -1,23 +1,41 @@
-name: Keep Streamlit App Alive
+name: Enhanced Streamlit Keep-Alive
 
 on:
   schedule:
-    # Executa a cada 6 horas (você pode ajustar conforme necessário)
-    - cron: '0 */6 * * *'
-  workflow_dispatch:  # Permite execução manual através da interface do GitHub
+    # Executa a cada 3 horas
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping Streamlit App
+      - name: Advanced Ping with Session
         run: |
-          response=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.STREAMLIT_APP_URL }})
-          echo "Status code: $response"
-          if [ "$response" = "200" ]; then
-            echo "Ping successful!"
-          else
-            echo "Ping returned status code: $response"
-          fi
-      - name: Log timestamp
-        run: echo "Ping sent at $(date)"
+          # Usa curl com cookies e user-agent para simular melhor um navegador real
+          # Também faz múltiplas requisições para diferentes rotas
+          echo "Iniciando ping avançado em $(date)"
+          
+          # Armazena cookies de sessão
+          COOKIE_JAR="/tmp/cookies.txt"
+          
+          # Primeiro acesso - página principal
+          echo "Acessando página principal..."
+          curl -s -c $COOKIE_JAR -b $COOKIE_JAR \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            -o /dev/null \
+            -w "Status: %{http_code}\n" \
+            ${{ secrets.STREAMLIT_APP_URL }}
+          
+          # Aguarda um pouco para simular navegação
+          sleep 2
+          
+          # Segundo acesso - com parâmetro adicional
+          echo "Segundo acesso com parâmetro..."
+          curl -s -c $COOKIE_JAR -b $COOKIE_JAR \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            -o /dev/null \
+            -w "Status: %{http_code}\n" \
+            "${{ secrets.STREAMLIT_APP_URL }}?param=keepalive"
+          
+          echo "Ping concluído em $(date)"
